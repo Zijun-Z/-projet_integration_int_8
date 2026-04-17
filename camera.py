@@ -2,9 +2,7 @@ from maix import camera, display, image, nn, app
 from math import sqrt
 import time
 
-# -----------------------------
-# 你真正需要的类别过滤
-# -----------------------------
+# 需要的物品，其他的没放
 TARGET_IDS = {
     0,   # person
     1,   # bicycle
@@ -194,7 +192,7 @@ class Track:
         self.acc = (self.speed - self.prev_speed) / dt
         self.prev_speed = self.speed
 
-        # 宽高平滑，不建议直接对 class_id 做滤波
+        # 宽高平滑
         self.w = WH_SMOOTH * self.w + (1.0 - WH_SMOOTH) * obj.w
         self.h = WH_SMOOTH * self.h + (1.0 - WH_SMOOTH) * obj.h
 
@@ -322,7 +320,7 @@ while not app.need_exit():
     for tid in dead_ids:
         del trackers[tid]
 
-    # 8) 画出来
+    #画出来
     for tr in trackers.values():
         tr.draw(img)
 
