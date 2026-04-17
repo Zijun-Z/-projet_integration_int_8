@@ -1,8 +1,8 @@
-from maix import camera, display, image, nn, app
+from maix import camera, display, image, nn, app, uart, pinmap
 from math import sqrt
 import time
 
-# 需要的物品，其他的没放
+
 TARGET_IDS = {
     0,   # person
     1,   # bicycle
@@ -18,7 +18,7 @@ TARGET_IDS = {
     56,  # chair
     57,  # couch
     58,  # potted plant
-    60,  # dining table 
+    60,  # dining table
 }
 
 LABELS = {
@@ -39,11 +39,62 @@ LABELS = {
     60: "table",
 }
 
+# 视觉危险权重（供“主目标选择”使用，不是 DS 的最终权重）
+CLASS_PRIORITY = {
+    0: 1.0,
+    1: 0.9,
+    2: 1.0,
+    3: 1.0,
+    5: 1.0,
+    7: 1.0,
+    9: 0.3,
+    11: 0.4,
+    13: 0.8,
+    24: 0.6,
+    28: 0.6,
+    56: 0.8,
+    57: 0.8,
+    58: 0.5,
+    60: 0.7,
+}
+
 CONF_TH = 0.45
-MATCH_DIST_TH = 80       
-OUTLIER_DIST_TH = 100    
-MAX_MISSED = 5           
-WH_SMOOTH = 0.7          
+MATCH_DIST_TH = 80
+OUTLIER_DIST_TH = 100
+MAX_MISSED = 5
+WH_SMOOTH = 0.7
+
+# -----------------------------
+# 频率控制（解决相机和 ToF 不同频率问题）
+# -----------------------------
+# MaixCam 只按固定频率往 STM32 发结果，不每帧都发。
+# 例如 100ms -> 10Hz。STM32 可用 20Hz 左右跑 ToF 和融合。
+REPORT_INTERVAL_MS = 100
+
+# -----------------------------
+# UART 配置
+# 推荐：如果引脚够用，优先走 UART1（A19 TX / A18 RX），避免 UART0 启动日志干扰。
+# 如果你已经把 STM32 接到 A16/A17，也可以把 USE_UART1 改成 False。
+# -----------------------------
+USE_UART1 = True
+BAUD = 115200
+
+
+def init_uart():
+    try:
+        if USE_UART1:
+            pinmap.set_pin_function("A18", "UART1_RX")
+            pinmap.set_pin_function("A19", "UART1_TX")
+            device = "/dev/ttyS1"
+        else:
+            # UART0 默认可用，对应 A16/A17
+            device = "/dev/ttyS0"
+        serial_dev = uart.UART(device, BAUD)
+        print("UART ready:", device, BAUD)
+        return serial_dev
+    except Exception as e:
+        print("UART init failed:", e)
+        return None
 
 
 def center_of_obj(obj):
@@ -63,8 +114,8 @@ class Kalman1D:
     measurement = pos
     """
     def __init__(self, process_var=300.0, measure_var=25.0):
-        self.x = 0.0   # pos
-        self.v = 0.0   # vel
+        self.x = 0.0
+        self.v = 0.0
 
         self.P00 = 1000.0
         self.P01 = 0.0
@@ -84,10 +135,8 @@ class Kalman1D:
         if not self.initialized:
             return self.x
 
-        # 状态预测
         self.x = self.x + dt * self.v
 
-        # 协方差预测
         q00 = 0.25 * self.q * dt * dt * dt * dt
         q01 = 0.5 * self.q * dt * dt * dt
         q10 = q01
@@ -107,8 +156,8 @@ class Kalman1D:
             return
 
         z = float(z)
-        y = z - self.x                # innovation
-        S = self.P00 + self.r         # innovation covariance
+        y = z - self.x
+        S = self.P00 + self.r
 
         K0 = self.P00 / S
         K1 = self.P10 / S
@@ -118,11 +167,9 @@ class Kalman1D:
         P10_old = self.P10
         P11_old = self.P11
 
-        # 状态更新
         self.x = self.x + K0 * y
         self.v = self.v + K1 * y
 
-        # 协方差更新
         self.P00 = (1.0 - K0) * P00_old
         self.P01 = (1.0 - K0) * P01_old
         self.P10 = P10_old - K1 * P00_old
@@ -156,9 +203,12 @@ class Track:
         self.last_area = max(1.0, self.w * self.h)
         self.area_ratio = 0.0
         self.motion_z = "stable"
+        self.motion_code = 0  # 0 stable, 1 approaching, 2 leaving
 
         self.last_t = now
         self.missed = 0
+        self.hit_streak = 1
+        self.age = 1
 
     def predict(self, now):
         dt = max(0.01, now - self.last_t)
@@ -171,12 +221,11 @@ class Track:
 
     def update(self, obj, now):
         dt = max(0.01, now - self.last_t)
-
         meas_cx, meas_cy = center_of_obj(obj)
 
-        # 异常点拒绝：测量和预测差太大则不信这一帧
         if dist2((self.cx, self.cy), (meas_cx, meas_cy)) > OUTLIER_DIST_TH * OUTLIER_DIST_TH:
             self.missed += 1
+            self.hit_streak = 0
             self.last_t = now
             return
 
@@ -192,7 +241,6 @@ class Track:
         self.acc = (self.speed - self.prev_speed) / dt
         self.prev_speed = self.speed
 
-        # 宽高平滑
         self.w = WH_SMOOTH * self.w + (1.0 - WH_SMOOTH) * obj.w
         self.h = WH_SMOOTH * self.h + (1.0 - WH_SMOOTH) * obj.h
 
@@ -202,18 +250,24 @@ class Track:
 
         if self.area_ratio > 0.10:
             self.motion_z = "approaching"
+            self.motion_code = 1
         elif self.area_ratio < -0.10:
             self.motion_z = "leaving"
+            self.motion_code = 2
         else:
             self.motion_z = "stable"
+            self.motion_code = 0
 
         self.class_id = obj.class_id
         self.score = obj.score
         self.missed = 0
+        self.hit_streak += 1
+        self.age += 1
         self.last_t = now
 
     def mark_missed(self, now):
         self.missed += 1
+        self.hit_streak = 0
         self.last_t = now
 
     def draw(self, img):
@@ -226,7 +280,7 @@ class Track:
         img.draw_rect(x, y, w, h, color=color)
 
         label = LABELS.get(self.class_id, str(self.class_id))
-        txt = "#{} {} {:.1f} {}".format(self.id, label, self.speed, self.motion_z)
+        txt = "#{} {} hs:{} {:.1f} {}".format(self.id, label, self.hit_streak, self.speed, self.motion_z)
         img.draw_string(x, max(0, y - 14), txt, color=color)
 
 
@@ -268,20 +322,85 @@ def associate_tracks(trackers, detections):
     return matches, unmatched_tracks, unmatched_dets
 
 
+def clamp01(x):
+    if x < 0.0:
+        return 0.0
+    if x > 1.0:
+        return 1.0
+    return x
+
+
+def track_priority(tr, img_w, img_h):
+    """
+    用于决定“发给 STM32 的主目标”是谁。
+    这里不是最终 DS 公式，只是通信阶段的主目标排序。
+    """
+    class_p = CLASS_PRIORITY.get(tr.class_id, 0.4)
+    score_p = tr.score
+    area_p = clamp01((tr.w * tr.h) / 12000.0)
+    dx = abs(tr.cx - img_w / 2.0) / (img_w / 2.0)
+    center_p = clamp01(1.0 - dx)
+    stable_p = clamp01(tr.hit_streak / 5.0)
+    return class_p * score_p * area_p * center_p * stable_p
+
+
+def select_main_track(trackers, img_w, img_h):
+    best = None
+    best_score = -1.0
+    for tr in trackers.values():
+        if tr.missed != 0:
+            continue
+        s = track_priority(tr, img_w, img_h)
+        if s > best_score:
+            best_score = s
+            best = tr
+    return best
+
+
+def send_track(serial_dev, tr, now_ms):
+    if serial_dev is None:
+        return
+
+    if tr is None:
+        # 无目标包：detected=0，保留时间戳，STM32 可据此判断“当前无检测”
+        line = "@CAM,0,-1,-1,0,0,0,0,0,0,0,0,{}\r\n".format(now_ms)
+    else:
+        line = "@CAM,1,{},{},{:.3f},{},{},{},{},{},{:.2f},{},{}\r\n".format(
+            tr.id,
+            tr.class_id,
+            tr.score,
+            int(tr.cx),
+            int(tr.cy),
+            int(tr.w),
+            int(tr.h),
+            tr.hit_streak,
+            tr.speed,
+            tr.motion_code,
+            now_ms,
+        )
+    try:
+        serial_dev.write_str(line)
+    except Exception as e:
+        print("UART write failed:", e)
+
+
 # -----------------------------
 # 模型与设备
 # -----------------------------
 detector = nn.YOLO11(model="/root/models/yolo11n.mud", dual_buff=True)
 cam = camera.Camera(detector.input_width(), detector.input_height(), detector.input_format())
 disp = display.Display()
+serial_dev = init_uart()
 
 trackers = {}
 next_track_id = 1
+last_report_ms = 0
 
 while not app.need_exit():
     img = cam.read()
     raw_objs = detector.detect(img)
     now = time.time()
+    now_ms = int(now * 1000)
 
     # 1) 过滤类别和置信度
     detections = []
@@ -320,8 +439,21 @@ while not app.need_exit():
     for tid in dead_ids:
         del trackers[tid]
 
-    #画出来
+    # 8) 选择主目标并定频发送到 STM32
+    if now_ms - last_report_ms >= REPORT_INTERVAL_MS:
+        best_tr = select_main_track(trackers, img.width(), img.height())
+        send_track(serial_dev, best_tr, now_ms)
+        last_report_ms = now_ms
+
+    # 9) 画出来
     for tr in trackers.values():
         tr.draw(img)
+
+    main_tr = select_main_track(trackers, img.width(), img.height())
+    if main_tr is not None:
+        dbg = "UART:{}Hz best=#{} {}".format(int(1000 / REPORT_INTERVAL_MS), main_tr.id, LABELS.get(main_tr.class_id, str(main_tr.class_id)))
+    else:
+        dbg = "UART:{}Hz best=None".format(int(1000 / REPORT_INTERVAL_MS))
+    img.draw_string(4, 4, dbg, color=image.COLOR_RED)
 
     disp.show(img)
